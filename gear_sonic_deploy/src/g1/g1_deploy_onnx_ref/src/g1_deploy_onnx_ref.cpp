@@ -3173,15 +3173,11 @@ class G1Deploy {
       std::array<double, G1_NUM_MOTOR> motor_torque = {0.0};
       const auto& active_default_angles = dex_rl_lab_mode_ ? default_angles_dex_rl_lab : default_angles;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        if (dex_rl_lab_mode_) {
-          // IsaacLab/SDK order: body_q[i] = joint i in IsaacLab order
-          body_q[i] = unitree_joint_state[i].q() - active_default_angles[i];
-          body_dq[i] = unitree_joint_state[i].dq();
-        } else {
-          // MuJoCo/URDF order (original SONIC pipeline)
-          body_q[i] = unitree_joint_state[mujoco_to_isaaclab[i]].q() - active_default_angles[mujoco_to_isaaclab[i]];
-          body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq();
-        }
+        // i is IsaacLab joint index; unitree_joint_state[] and active_default_angles[]
+        // are both indexed in hardware/SDK (MuJoCo) order. mujoco_to_isaaclab[i] maps
+        // an IsaacLab index to the corresponding MuJoCo index.
+        body_q[i] = unitree_joint_state[mujoco_to_isaaclab[i]].q() - active_default_angles[mujoco_to_isaaclab[i]];
+        body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq();
         // Safety check: use the value regardless of ordering
         if (body_dq[i] > 35 && !disable_crc_check_) {
           std::cout << "✗ Error: body_dq[" << i << "] = " << body_dq[i] << " > 35."
@@ -3475,15 +3471,14 @@ class G1Deploy {
       MotorCommand motor_command_tmp;
       const auto& cmd_default_angles = dex_rl_lab_mode_ ? default_angles_dex_rl_lab : default_angles;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        double action_value;
-        if (dex_rl_lab_mode_) {
-          // DEX_RL_LAB: policy output is in IsaacLab order, uniform scale 0.25
-          action_value = static_cast<double>(floatarr[i]) * 0.25;
-        } else {
-          // SONIC: policy output is in MuJoCo order, per-joint action scale
-          action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
-        }
-        last_action[i] = static_cast<double>(floatarr[i]);
+        // i is the motor hardware/SDK (MuJoCo) index. Policy output floatarr[] is in
+        // IsaacLab order; isaaclab_to_mujoco[i] maps this hardware index to the
+        // corresponding IsaacLab index so we can pick the right action element.
+        const int isaaclab_idx = isaaclab_to_mujoco[i];
+        const double scale = dex_rl_lab_mode_ ? 0.25 : g1_action_scale[i];
+        const double action_value = static_cast<double>(floatarr[isaaclab_idx]) * scale;
+        // last_action stays in IsaacLab order to match the policy's observation format.
+        last_action[isaaclab_idx] = static_cast<double>(floatarr[isaaclab_idx]);
         motor_command_tmp.q_target.at(i) = static_cast<float>(cmd_default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = dex_rl_lab_mode_ ? kps_dex_rl_lab[i] : kps[i];

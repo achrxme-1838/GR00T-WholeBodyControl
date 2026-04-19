@@ -1,0 +1,44 @@
+# MoE Student - Observation Configuration
+# =========================================
+# Single policy: obs -> policy.onnx -> action
+# No token_state, no encoder.
+#
+# Order MUST match PolicyCfg in g1_29dof_sonic_distill.py exactly.
+# Total dimension: 3902
+#
+# Proprioception history (25 frames):
+#   base_ang_vel:      3 x 25 =   75
+#   joint_pos_rel:    29 x 25 =  725
+#   joint_vel_rel:    29 x 25 =  725
+#   last_action:      29 x 25 =  725
+#   projected_gravity: 3 x 25 =   75
+#
+# Future motion reference (20 frames, step 2):
+#   future_motion_joint_pos:  29 x 20 = 580
+#   future_motion_joint_vel:  29 x 20 = 580
+#   future_motion_anchor:      6 x 20 = 120
+#
+# Current-frame body diffs (30 tracked + 3 extended = 33 bodies):
+#   diff_body_pos_b:     33 x 3 =  99
+#   diff_body_tannorm_pb: 33 x 6 = 198
+
+observations:
+
+  # --- Proprioception history (history_length=25, step=1) ---
+
+  - name: "base_angular_velocity"
+    enabled: true
+
+  - name: "body_joint_positions"
+    enabled: true
+
+  - name: "body_joint_velocities"
+    enabled: true
+
+  - name: "last_actions"
+    enabled: true
+
+  - name: "gravity_dir"
+    enabled: true
+
+
