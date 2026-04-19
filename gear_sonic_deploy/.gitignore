@@ -5,3 +5,6 @@ build/
 target/
 logs/
 *.trt
+
+# Auto-generated CSV cache from GMR pkl conversion (deploy_moe_student.sh)
+reference/_gmr_cache/

@@ -183,7 +183,11 @@ show_usage() {
     echo "  --policy PATH           Set the policy ONNX file (default: policy/moe_student/policy.onnx)"
     echo "  --obs-config PATH       Set the observation config file (default: policy/moe_student/observation_config.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/target_vel/V2/planner_sonic.onnx)"
-    echo "  --motion-data PATH      Set the motion data path (default: reference/example/)"
+    echo "  --motion-data PATH      Motion data path. Accepts:"
+    echo "                            - CSV motion directory (reference/example/)"
+    echo "                            - GMR .pkl file or directory of .pkls (auto-converted)"
+    echo "                          (default: $MOTION_DATA_DEFAULT)"
+    echo "  --gmr-fps FPS           Target playback fps for GMR conversion (default: $GMR_FPS_DEFAULT; 0 = keep source)"
     echo "  --input-type TYPE       Set the input type (default: manager)"
     echo "  --output-type TYPE      Set the output type (default: all)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
@@ -210,10 +214,20 @@ INTERFACE_MODE="real"
 # OBS_CONFIG_DEFAULT="policy/moe_student/observation_config.yaml"
 # POLICY_DEFAULT="policy/moe_student_test/student.onnx"
 # OBS_CONFIG_DEFAULT="policy/moe_student_test/observation_config.yaml"
-POLICY_DEFAULT="policy/moe_student_test_2nd/student.onnx"
-OBS_CONFIG_DEFAULT="policy/moe_student_test_2nd/observation_config.yaml"
+# POLICY_DEFAULT="policy/moe_student_test_2nd/student.onnx"
+# OBS_CONFIG_DEFAULT="policy/moe_student_test_2nd/observation_config.yaml"
+POLICY_DEFAULT="policy/moe_student_test_3rd/student.onnx"
+OBS_CONFIG_DEFAULT="policy/moe_student_test_3rd/observation_config.yaml"
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
-MOTION_DATA_DEFAULT="reference/example/"
+# MOTION_DATA_DEFAULT="reference/example/"
+# Accepts any of:
+#   - a CSV motion directory (reference/example/)
+#   - a directory of GMR .pkl files (reference/GMR/) -> auto-converted
+#   - a single GMR .pkl file                          -> auto-converted
+MOTION_DATA_DEFAULT="reference/GMR/"
+GMR_CONVERTER_DEFAULT="reference/convert_gmr_motions.py"
+GMR_OUTPUT_CACHE_DEFAULT="reference/_gmr_cache/"
+GMR_FPS_DEFAULT="50"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
@@ -264,6 +278,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             MOTION_DATA="$2"
+            shift 2
+            ;;
+        --gmr-fps)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --gmr-fps requires a value${NC}" >&2
+                exit 1
+            fi
+            GMR_FPS_DEFAULT="$2"
             shift 2
             ;;
         --input-type)
@@ -379,11 +401,99 @@ check_file "$POLICY" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$OBS_CONFIG" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$PLANNER" || MISSING_FILES=$((MISSING_FILES + 1))
 
-if [ -d "$MOTION_DATA" ]; then
-    echo -e "${GREEN}Found: $MOTION_DATA${NC}"
-else
-    echo -e "${RED}Missing directory: $MOTION_DATA${NC}"
+# Motion data can be:
+#   - a CSV motion directory (contains subdirs with joint_pos.csv etc.)
+#   - a directory of GMR .pkl files (requires conversion)
+#   - a single GMR .pkl file (requires conversion)
+dir_has_gmr_pkls() {
+    local dir="$1"
+    [ -d "$dir" ] && compgen -G "$dir"/*.pkl > /dev/null
+}
+
+dir_has_csv_motions() {
+    local dir="$1"
+    if [ ! -d "$dir" ]; then return 1; fi
+    local sub
+    for sub in "$dir"/*/; do
+        if [ -f "$sub/joint_pos.csv" ] || [ -f "$sub/body_pos.csv" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Hash the source path + mtime so the cache key changes when source files do.
+gmr_cache_key() {
+    local src="$1"
+    local stamp
+    if [ -d "$src" ]; then
+        stamp=$(find "$src" -maxdepth 1 -name '*.pkl' -printf '%f:%T@\n' 2>/dev/null | sort)
+    else
+        stamp=$(stat -c '%n:%Y' "$src" 2>/dev/null)
+    fi
+    printf '%s' "$stamp" | sha1sum | awk '{print $1}' | cut -c1-12
+}
+
+convert_gmr_if_needed() {
+    local src="$1"
+    local is_pkl_source=false
+    if [ -f "$src" ] && [[ "$src" == *.pkl ]]; then
+        is_pkl_source=true
+    elif dir_has_gmr_pkls "$src" && ! dir_has_csv_motions "$src"; then
+        is_pkl_source=true
+    fi
+
+    if ! $is_pkl_source; then
+        echo "$src"
+        return 0
+    fi
+
+    if [ ! -f "$GMR_CONVERTER_DEFAULT" ]; then
+        echo -e "${RED}GMR converter not found: $GMR_CONVERTER_DEFAULT${NC}" >&2
+        return 1
+    fi
+
+    local key
+    key=$(gmr_cache_key "$src")
+    local src_stem
+    if [ -f "$src" ]; then
+        src_stem=$(basename "$src" .pkl)
+    else
+        src_stem=$(basename "$(cd "$src" && pwd)")
+    fi
+    local out_dir="$GMR_OUTPUT_CACHE_DEFAULT$src_stem-$key"
+
+    if [ -d "$out_dir" ] && dir_has_csv_motions "$out_dir"; then
+        echo -e "${GREEN}Using cached GMR conversion: $out_dir${NC}" >&2
+    else
+        echo -e "${YELLOW}Converting GMR motions -> CSV: $src -> $out_dir${NC}" >&2
+        mkdir -p "$out_dir"
+        if ! python3 "$GMR_CONVERTER_DEFAULT" "$src" "$out_dir" --fps "$GMR_FPS_DEFAULT" >&2; then
+            echo -e "${RED}GMR conversion failed${NC}" >&2
+            return 1
+        fi
+    fi
+
+    echo "$out_dir"
+    return 0
+}
+
+if [ ! -e "$MOTION_DATA" ]; then
+    echo -e "${RED}Missing motion-data path: $MOTION_DATA${NC}"
     MISSING_FILES=$((MISSING_FILES + 1))
+else
+    if RESOLVED_MOTION_DATA=$(convert_gmr_if_needed "$MOTION_DATA"); then
+        MOTION_DATA="$RESOLVED_MOTION_DATA"
+        if [ -d "$MOTION_DATA" ] && dir_has_csv_motions "$MOTION_DATA"; then
+            echo -e "${GREEN}Found motion data: $MOTION_DATA${NC}"
+        else
+            echo -e "${RED}Resolved motion data has no CSV motions: $MOTION_DATA${NC}"
+            MISSING_FILES=$((MISSING_FILES + 1))
+        fi
+    else
+        echo -e "${RED}Failed to prepare motion data from: $MOTION_DATA${NC}"
+        MISSING_FILES=$((MISSING_FILES + 1))
+    fi
 fi
 
 if [ $MISSING_FILES -gt 0 ]; then
