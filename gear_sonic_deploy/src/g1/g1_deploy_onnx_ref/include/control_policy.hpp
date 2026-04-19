@@ -106,16 +106,11 @@ public:
         inference_engine_.reset();
         return false;
       }
-      if (std::find(input_names.begin(), input_names.end(), std::string("obs_dict")) == input_names.end()) {
-        std::cerr << "✗ Policy input tensor 'obs_dict' not found. Available inputs: ";
-        for (const auto& n : input_names) std::cerr << n << ' ';
-        std::cerr << std::endl;
-        inference_engine_.reset();
-        return false;
-      }
-      input_tensor_name_ = "obs_dict";
+      // Accept any single input tensor name (e.g. "obs_dict" for encoder/decoder, "obs" for single policy)
+      input_tensor_name_ = input_names[0];
+      std::cout << "  Policy input tensor: " << input_tensor_name_ << std::endl;
       if (inference_engine_->GetTensorDataType(input_tensor_name_) != DataType::FLOAT) {
-        std::cerr << "✗ Policy input 'obs_dict' must be float32" << std::endl;
+        std::cerr << "✗ Policy input '" << input_tensor_name_ << "' must be float32" << std::endl;
         inference_engine_.reset();
         return false;
       }
@@ -146,14 +141,9 @@ public:
         inference_engine_.reset();
         return false;
       }
-      if (std::find(output_names.begin(), output_names.end(), std::string("action")) == output_names.end()) {
-        std::cerr << "✗ Policy output tensor 'action' not found. Available outputs: ";
-        for (const auto& n : output_names) std::cerr << n << ' ';
-        std::cerr << std::endl;
-        inference_engine_.reset();
-        return false;
-      }
-      output_tensor_name_ = "action";
+      // Accept any single output tensor name (e.g. "action" for encoder/decoder, "actions" for single policy)
+      output_tensor_name_ = output_names[0];
+      std::cout << "  Policy output tensor: " << output_tensor_name_ << std::endl;
 
       // Get output dimensions
       std::vector<int64_t> output_dims;

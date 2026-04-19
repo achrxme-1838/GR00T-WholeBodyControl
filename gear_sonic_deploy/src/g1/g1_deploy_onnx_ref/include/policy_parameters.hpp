@@ -206,7 +206,7 @@ const std::array<float, 29> kds = {
     DAMPING_4010, // right_wrist_yaw_joint
 };
 
-// Default joint angles (standing pose)
+// Default joint angles (standing pose) - SONIC pipeline
 const std::array<double, 29> default_angles = {
     -0.312, // left_hip_pitch_joint
     0.0, // left_hip_roll_joint
@@ -235,6 +235,105 @@ const std::array<double, 29> default_angles = {
     0.0, // right_shoulder_yaw_joint
     0.6, // right_elbow_joint
     0.0, // right_wrist_roll_joint
+    0.0, // right_wrist_pitch_joint
+    0.0 // right_wrist_yaw_joint
+};
+
+// PID gains for DEX_RL_LAB policies (from UNITREE_G1_29DOF_CFG actuator config)
+// These must match the stiffness/damping used during RL training.
+const std::array<float, 29> kps_dex_rl_lab = {
+    100.0f, // left_hip_pitch_joint
+    100.0f, // left_hip_roll_joint
+    100.0f, // left_hip_yaw_joint
+    150.0f, // left_knee_joint
+    40.0f,  // left_ankle_pitch_joint
+    40.0f,  // left_ankle_roll_joint
+    100.0f, // right_hip_pitch_joint
+    100.0f, // right_hip_roll_joint
+    100.0f, // right_hip_yaw_joint
+    150.0f, // right_knee_joint
+    40.0f,  // right_ankle_pitch_joint
+    40.0f,  // right_ankle_roll_joint
+    200.0f, // waist_yaw_joint
+    40.0f,  // waist_roll_joint
+    40.0f,  // waist_pitch_joint
+    40.0f,  // left_shoulder_pitch_joint
+    40.0f,  // left_shoulder_roll_joint
+    40.0f,  // left_shoulder_yaw_joint
+    40.0f,  // left_elbow_joint
+    40.0f,  // left_wrist_roll_joint
+    40.0f,  // left_wrist_pitch_joint
+    40.0f,  // left_wrist_yaw_joint
+    40.0f,  // right_shoulder_pitch_joint
+    40.0f,  // right_shoulder_roll_joint
+    40.0f,  // right_shoulder_yaw_joint
+    40.0f,  // right_elbow_joint
+    40.0f,  // right_wrist_roll_joint
+    40.0f,  // right_wrist_pitch_joint
+    40.0f,  // right_wrist_yaw_joint
+};
+
+const std::array<float, 29> kds_dex_rl_lab = {
+    2.0f,  // left_hip_pitch_joint
+    2.0f,  // left_hip_roll_joint
+    2.0f,  // left_hip_yaw_joint
+    4.0f,  // left_knee_joint
+    2.0f,  // left_ankle_pitch_joint
+    2.0f,  // left_ankle_roll_joint
+    2.0f,  // right_hip_pitch_joint
+    2.0f,  // right_hip_roll_joint
+    2.0f,  // right_hip_yaw_joint
+    4.0f,  // right_knee_joint
+    2.0f,  // right_ankle_pitch_joint
+    2.0f,  // right_ankle_roll_joint
+    5.0f,  // waist_yaw_joint
+    5.0f,  // waist_roll_joint
+    5.0f,  // waist_pitch_joint
+    1.0f,  // left_shoulder_pitch_joint
+    1.0f,  // left_shoulder_roll_joint
+    1.0f,  // left_shoulder_yaw_joint
+    1.0f,  // left_elbow_joint
+    1.0f,  // left_wrist_roll_joint
+    1.0f,  // left_wrist_pitch_joint
+    1.0f,  // left_wrist_yaw_joint
+    1.0f,  // right_shoulder_pitch_joint
+    1.0f,  // right_shoulder_roll_joint
+    1.0f,  // right_shoulder_yaw_joint
+    1.0f,  // right_elbow_joint
+    1.0f,  // right_wrist_roll_joint
+    1.0f,  // right_wrist_pitch_joint
+    1.0f,  // right_wrist_yaw_joint
+};
+
+// Default joint angles for DEX_RL_LAB policies (from UNITREE_G1_29DOF_CFG init_state)
+const std::array<double, 29> default_angles_dex_rl_lab = {
+    -0.1, // left_hip_pitch_joint
+    0.0, // left_hip_roll_joint
+    0.0, // left_hip_yaw_joint
+    0.3, // left_knee_joint
+    -0.2, // left_ankle_pitch_joint
+    0.0, // left_ankle_roll_joint
+    -0.1, // right_hip_pitch_joint
+    0.0, // right_hip_roll_joint
+    0.0, // right_hip_yaw_joint
+    0.3, // right_knee_joint
+    -0.2, // right_ankle_pitch_joint
+    0.0, // right_ankle_roll_joint
+    0.0, // waist_yaw_joint
+    0.0, // waist_roll_joint
+    0.0, // waist_pitch_joint
+    0.3, // left_shoulder_pitch_joint
+    0.25, // left_shoulder_roll_joint
+    0.0, // left_shoulder_yaw_joint
+    0.97, // left_elbow_joint
+    0.15, // left_wrist_roll_joint
+    0.0, // left_wrist_pitch_joint
+    0.0, // left_wrist_yaw_joint
+    0.3, // right_shoulder_pitch_joint
+    -0.25, // right_shoulder_roll_joint
+    0.0, // right_shoulder_yaw_joint
+    0.97, // right_elbow_joint
+    -0.15, // right_wrist_roll_joint
     0.0, // right_wrist_pitch_joint
     0.0 // right_wrist_yaw_joint
 };

@@ -46,6 +46,9 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include <iomanip>
+#include <limits>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
@@ -126,6 +129,9 @@
 
 // Encoder
 #include "../include/encoder.hpp"
+
+// Forward kinematics (for diff_body observations)
+#include "../include/fk.hpp"
 
 // Control policy
 #include "../include/control_policy.hpp"
@@ -248,6 +254,9 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
+
+    // DEX_RL_LAB mode: uses IsaacLab joint order, uniform action scale, matching default angles, obs scaling
+    bool dex_rl_lab_mode_ = false;
     
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -387,6 +396,30 @@ class G1Deploy {
         : name(n), function(f), offset(off), dimension(dim) {}
     };
     
+    // =========================================================================
+    // Forward kinematics for runtime robot body position computation
+    // =========================================================================
+    std::unique_ptr<RobotFK> robot_fk_;               // FK solver loaded from MuJoCo XML
+    static constexpr int NUM_FK_BODIES = 30;           // 30 bodies in kinematic tree (pelvis + 29 joints)
+    static constexpr int NUM_EXTENDED_BODIES = 3;      // left_hand_ext, right_hand_ext, head_ext
+    static constexpr int NUM_TOTAL_BODIES = NUM_FK_BODIES + NUM_EXTENDED_BODIES; // 33
+    std::array<std::array<double, 3>, NUM_FK_BODIES> robot_fk_positions_;   // FK output: world positions
+    std::array<std::array<double, 4>, NUM_FK_BODIES> robot_fk_rotations_;   // FK output: world rotations (wxyz)
+    // Extended body definitions: {parent_fk_index, offset_x, offset_y, offset_z}
+    // Matches SMPLCfg.extending.extended_joints in g1_29dof_smpl_cfg.py:
+    //   left_hand_link_ext:  parent=left_wrist_yaw_link (FK idx 22), offset=(0.0415, 0.003, 0.0)
+    //   right_hand_link_ext: parent=right_wrist_yaw_link (FK idx 29), offset=(0.0415, -0.003, 0.0)
+    //   head_link_ext:       parent=torso_link (FK idx 15), offset=(0.0, 0.0, 0.4)
+    struct ExtendedBodyDef {
+      int parent_fk_idx;
+      std::array<double, 3> offset;
+    };
+    const std::array<ExtendedBodyDef, NUM_EXTENDED_BODIES> extended_body_defs_ = {{
+      {22, {0.0415, 0.003, 0.0}},   // left_hand_link_ext
+      {29, {0.0415, -0.003, 0.0}},  // right_hand_link_ext
+      {15, {0.0, 0.0, 0.4}},        // head_link_ext
+    }};
+
     // Pre-allocated observation buffers to avoid allocation in control loop
     std::vector<double> obs_buffer_;          // Policy observation buffer
     std::vector<double> encoder_obs_buffer_;  // Encoder observation buffer
@@ -770,12 +803,22 @@ class G1Deploy {
         // If body part indexes are empty, gather all joints
         if (joint_indexes.empty()) {
           size_t frame_offset = offset + frame_idx * 29;  // 29 joints per frame
-          std::copy(
-            motion_joint_pos,
-            motion_joint_pos + num_joints,
-            target_buffer.begin() + frame_offset
-          );
-          
+
+          // DEX_RL_LAB mode: motion data is in MuJoCo interleaved order, policy expects IsaacLab order
+          if (dex_rl_lab_mode_) {
+            std::array<double, 29> reordered;
+            for (int j = 0; j < 29; j++) {
+              reordered[j] = motion_joint_pos[isaaclab_to_mujoco[j]];
+            }
+            std::copy(reordered.begin(), reordered.end(), target_buffer.begin() + frame_offset);
+          } else {
+            std::copy(
+              motion_joint_pos,
+              motion_joint_pos + num_joints,
+              target_buffer.begin() + frame_offset
+            );
+          }
+
           // If upper body control is enabled, use upper body joint positions in buffer to replace the motion_joint_pos
           if (has_upper_body_data_) {
             std::array<double, 29> current_motion_joint_pos;
@@ -848,11 +891,20 @@ class G1Deploy {
         if (joint_indexes.empty()) {
           size_t frame_offset = offset + frame_idx * 29;  // 29 joints per frame
           if (operator_state.play) {
-            std::copy(
-              motion_joint_vel,
-              motion_joint_vel + num_joints,
-              target_buffer.begin() + frame_offset
-            );
+            // DEX_RL_LAB mode: motion data is in MuJoCo interleaved order, policy expects IsaacLab order
+            if (dex_rl_lab_mode_) {
+              std::array<double, 29> reordered;
+              for (int j = 0; j < 29; j++) {
+                reordered[j] = motion_joint_vel[isaaclab_to_mujoco[j]];
+              }
+              std::copy(reordered.begin(), reordered.end(), target_buffer.begin() + frame_offset);
+            } else {
+              std::copy(
+                motion_joint_vel,
+                motion_joint_vel + num_joints,
+                target_buffer.begin() + frame_offset
+              );
+            }
             // If upper body control is enabled, use upper body joint velocities in buffer to replace the motion_joint_vel
             if (has_upper_body_data_) {
               std::array<double, 29> current_motion_joint_vel;
@@ -1516,12 +1568,16 @@ class G1Deploy {
         }
       }
 
+      // DEX_RL_LAB applies scale=0.05 to joint_vel_rel observations
+      const double vel_scale = dex_rl_lab_mode_ ? 0.05 : 1.0;
       for (int f = 0; f < num_frames; ++f) {
         const auto &entry = hist[static_cast<size_t>(f)];
         if (body_part_indexes.empty()) {
           size_t frame_offset = offset + static_cast<size_t>(f) * joints;
           if (!entry.body_dq.empty()) {
-            std::copy(entry.body_dq.begin(), entry.body_dq.begin() + joints, target_buffer.begin() + frame_offset);
+            for (int j = 0; j < joints; ++j) {
+              target_buffer[frame_offset + j] = entry.body_dq[j] * vel_scale;
+            }
           } else {
             std::fill_n(target_buffer.begin() + frame_offset, joints, 0.0);
           }
@@ -1530,7 +1586,8 @@ class G1Deploy {
           if (!entry.body_dq.empty()) {
             for (size_t i = 0; i < body_part_indexes.size(); ++i) {
               int idx = body_part_indexes[i];
-              target_buffer[frame_offset + i] = (idx >= 0 && static_cast<size_t>(idx) < entry.body_dq.size()) ? entry.body_dq[static_cast<size_t>(idx)] : 0.0;
+              double val = (idx >= 0 && static_cast<size_t>(idx) < entry.body_dq.size()) ? entry.body_dq[static_cast<size_t>(idx)] : 0.0;
+              target_buffer[frame_offset + i] = val * vel_scale;
             }
           } else {
             std::fill_n(target_buffer.begin() + frame_offset, body_part_indexes.size(), 0.0);
@@ -1596,12 +1653,14 @@ class G1Deploy {
         return false;
       }
       
+      // DEX_RL_LAB applies scale=0.2 to base_ang_vel observations
+      const double scale = dex_rl_lab_mode_ ? 0.2 : 1.0;
       for (int f = 0; f < num_frames; ++f) {
         const auto &entry = hist[static_cast<size_t>(f)];
         size_t frame_offset = offset + static_cast<size_t>(f) * 3;
-        target_buffer[frame_offset + 0] = entry.base_ang_vel[0];
-        target_buffer[frame_offset + 1] = entry.base_ang_vel[1];
-        target_buffer[frame_offset + 2] = entry.base_ang_vel[2];
+        target_buffer[frame_offset + 0] = entry.base_ang_vel[0] * scale;
+        target_buffer[frame_offset + 1] = entry.base_ang_vel[1] * scale;
+        target_buffer[frame_offset + 2] = entry.base_ang_vel[2] * scale;
       }
       return true;
     }
@@ -1688,6 +1747,219 @@ class G1Deploy {
       target_buffer[offset] = static_cast<float>(current_motion_->GetEncodeMode());
       for (int i = 1; i <= fill_zeros_num; ++i) {
         target_buffer[offset + i] = 0;
+      }
+      return true;
+    }
+
+    // =========================================================================
+    // Body diff observation gatherers (diff_body_pos_b, diff_body_tannorm_pb)
+    //
+    // Computes difference between robot body state (via runtime FK) and
+    // reference motion body state, expressed in the robot body frame.
+    // Matches Python: diff_body_pos_b / diff_body_tannorm_pb in mimic_observations.py
+    //
+    // Bodies: 30 tracked (FK tree) + 3 extended = 33 total.
+    // =========================================================================
+
+    /// Compute robot FK from current sensor state and store in robot_fk_positions_/rotations_.
+    /// Returns false if FK is not available or sensor data is missing.
+    bool ComputeRobotFK() {
+      if (!robot_fk_ || !state_logger_) return false;
+      auto hist = state_logger_->GetLatest(1, false);
+      if (hist.empty() || hist[0].body_q.empty()) return false;
+
+      const auto& entry = hist[0];
+      // Root position: use reference motion root pos as proxy (robot has no position sensor).
+      // This cancels out in the body-frame diff for non-root bodies.
+      std::array<double, 3> root_pos = {0.0, 0.0, 0.0};
+      if (current_motion_ && current_motion_->GetNumBodies() > 0) {
+        root_pos = current_motion_->BodyPositions(current_frame_)[0];
+      }
+
+      if (dex_rl_lab_mode_) {
+        // FK expects MuJoCo-ordered joint angles, but body_q is in IsaacLab order.
+        // Convert IsaacLab order → MuJoCo order for FK.
+        std::array<double, G1_NUM_MOTOR> body_q_mujoco;
+        for (int i = 0; i < G1_NUM_MOTOR; i++) {
+          body_q_mujoco[i] = entry.body_q[mujoco_to_isaaclab[i]];
+        }
+        robot_fk_->DoFK(
+          robot_fk_positions_.data(),
+          robot_fk_rotations_.data(),
+          root_pos,
+          entry.base_quat,
+          body_q_mujoco.data()
+        );
+      } else {
+        // SONIC: body_q is already in MuJoCo order
+        robot_fk_->DoFK(
+          robot_fk_positions_.data(),
+          robot_fk_rotations_.data(),
+          root_pos,
+          entry.base_quat,
+          entry.body_q.data()
+        );
+      }
+      return true;
+    }
+
+    /// Compute extended body world position from parent FK body + offset.
+    std::array<double, 3> ComputeExtendedBodyPos(int ext_idx) const {
+      const auto& def = extended_body_defs_[ext_idx];
+      auto offset_world = quat_rotate_d(robot_fk_rotations_[def.parent_fk_idx], def.offset);
+      return {
+        robot_fk_positions_[def.parent_fk_idx][0] + offset_world[0],
+        robot_fk_positions_[def.parent_fk_idx][1] + offset_world[1],
+        robot_fk_positions_[def.parent_fk_idx][2] + offset_world[2],
+      };
+    }
+
+    /// Compute extended body world rotation (same as parent).
+    std::array<double, 4> ComputeExtendedBodyRot(int ext_idx) const {
+      return robot_fk_rotations_[extended_body_defs_[ext_idx].parent_fk_idx];
+    }
+
+    /// Gather diff_body_pos_b: (ref_body_pos - robot_body_pos) rotated to robot body frame.
+    /// Output: 33 bodies x 3 = 99 values.
+    /// Matches Python: diff_body_pos_b in mimic_observations.py
+    bool GatherDiffBodyPosB(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->GetNumBodies() == 0) return false;
+      if (!ComputeRobotFK()) return false;
+      if (!state_logger_) return false;
+
+      auto hist = state_logger_->GetLatest(1, false);
+      if (hist.empty()) return false;
+      auto inv_root_quat = quat_conjugate_d(hist[0].base_quat);
+
+      int frame = static_cast<int>(current_frame_);
+      if (frame >= static_cast<int>(current_motion_->timesteps))
+        frame = static_cast<int>(current_motion_->timesteps) - 1;
+
+      const auto ref_body_pos = current_motion_->BodyPositions(frame);
+      const auto& motion_body_indexes = current_motion_->BodyPartIndexes();
+
+      // 30 tracked FK bodies
+      for (int i = 0; i < NUM_FK_BODIES; ++i) {
+        // Find reference motion storage index for this body
+        int storage_idx = -1;
+        for (size_t j = 0; j < motion_body_indexes.size(); ++j) {
+          if (motion_body_indexes[j] == i) { storage_idx = static_cast<int>(j); break; }
+        }
+        std::array<double, 3> diff_w;
+        if (storage_idx >= 0) {
+          diff_w = {
+            ref_body_pos[storage_idx][0] - robot_fk_positions_[i][0],
+            ref_body_pos[storage_idx][1] - robot_fk_positions_[i][1],
+            ref_body_pos[storage_idx][2] - robot_fk_positions_[i][2],
+          };
+        } else {
+          diff_w = {0.0, 0.0, 0.0};
+        }
+        auto diff_b = quat_rotate_d(inv_root_quat, diff_w);
+        target_buffer[offset + i * 3 + 0] = diff_b[0];
+        target_buffer[offset + i * 3 + 1] = diff_b[1];
+        target_buffer[offset + i * 3 + 2] = diff_b[2];
+      }
+
+      // 3 extended bodies
+      for (int e = 0; e < NUM_EXTENDED_BODIES; ++e) {
+        auto robot_ext_pos = ComputeExtendedBodyPos(e);
+        // Extended body index in motion data = NUM_FK_BODIES + e (30, 31, 32)
+        int ext_body_idx = NUM_FK_BODIES + e;
+        int storage_idx = -1;
+        for (size_t j = 0; j < motion_body_indexes.size(); ++j) {
+          if (motion_body_indexes[j] == ext_body_idx) { storage_idx = static_cast<int>(j); break; }
+        }
+        std::array<double, 3> diff_w;
+        if (storage_idx >= 0) {
+          diff_w = {
+            ref_body_pos[storage_idx][0] - robot_ext_pos[0],
+            ref_body_pos[storage_idx][1] - robot_ext_pos[1],
+            ref_body_pos[storage_idx][2] - robot_ext_pos[2],
+          };
+        } else {
+          diff_w = {0.0, 0.0, 0.0};
+        }
+        auto diff_b = quat_rotate_d(inv_root_quat, diff_w);
+        int idx = (NUM_FK_BODIES + e) * 3;
+        target_buffer[offset + idx + 0] = diff_b[0];
+        target_buffer[offset + idx + 1] = diff_b[1];
+        target_buffer[offset + idx + 2] = diff_b[2];
+      }
+      return true;
+    }
+
+    /// Gather diff_body_tannorm_pb: orientation diff between ref and robot, as tan-norm (6D).
+    /// Output: 33 bodies x 6 = 198 values.
+    /// Matches Python: diff_body_tannorm_pb in mimic_observations.py
+    ///
+    /// Python logic:
+    ///   diff_quat_w = quat_mul(ref_quat, quat_conjugate(robot_quat))
+    ///   inv_planar = quat_conjugate(planar_root_quat)
+    ///   diff_quat_pb = quat_mul(quat_mul(inv_planar, diff_quat_w), planar_root_quat)
+    ///   output = quat_to_tannorm(diff_quat_pb)  -> 6D (tan_x,tan_y,tan_z, norm_x,norm_y,norm_z)
+    bool GatherDiffBodyTannormPB(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->GetNumBodyQuaternions() == 0) return false;
+      if (!ComputeRobotFK()) return false;
+      if (!state_logger_) return false;
+
+      auto hist = state_logger_->GetLatest(1, false);
+      if (hist.empty()) return false;
+
+      // Planar root quat = heading-only quaternion from robot base
+      auto planar_root_quat = calc_heading_quat_d(hist[0].base_quat);
+      auto inv_planar = quat_conjugate_d(planar_root_quat);
+
+      int frame = static_cast<int>(current_frame_);
+      if (frame >= static_cast<int>(current_motion_->timesteps))
+        frame = static_cast<int>(current_motion_->timesteps) - 1;
+
+      const auto ref_body_quat = current_motion_->BodyQuaternions(frame);
+      const auto& motion_body_indexes = current_motion_->BodyPartIndexes();
+
+      // Helper lambda: compute tannorm 6D from a quaternion
+      auto quat_to_tannorm = [](const std::array<double, 4>& q) -> std::array<double, 6> {
+        // tan = rotate (1,0,0) by q
+        auto tan = quat_rotate_d(q, {1.0, 0.0, 0.0});
+        // norm = rotate (0,0,1) by q
+        auto norm = quat_rotate_d(q, {0.0, 0.0, 1.0});
+        return {tan[0], tan[1], tan[2], norm[0], norm[1], norm[2]};
+      };
+
+      // Helper lambda: process one body
+      auto process_body = [&](int body_idx, const std::array<double, 4>& robot_quat, size_t out_offset) {
+        // Find ref quat in motion data
+        int storage_idx = -1;
+        for (size_t j = 0; j < motion_body_indexes.size(); ++j) {
+          if (motion_body_indexes[j] == body_idx) { storage_idx = static_cast<int>(j); break; }
+        }
+        std::array<double, 6> tannorm;
+        if (storage_idx >= 0) {
+          auto ref_quat = ref_body_quat[storage_idx];
+          // diff_quat_w = ref_quat * conjugate(robot_quat)
+          auto diff_quat_w = quat_mul_d(ref_quat, quat_conjugate_d(robot_quat));
+          // diff_quat_pb = inv_planar * diff_quat_w * planar_root_quat
+          auto diff_quat_pb = quat_mul_d(quat_mul_d(inv_planar, diff_quat_w), planar_root_quat);
+          tannorm = quat_to_tannorm(diff_quat_pb);
+        } else {
+          // Identity rotation -> tannorm of identity quat (1,0,0,0)
+          tannorm = {1.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+        }
+        for (int k = 0; k < 6; ++k) {
+          target_buffer[out_offset + k] = tannorm[k];
+        }
+      };
+
+      // 30 tracked FK bodies
+      for (int i = 0; i < NUM_FK_BODIES; ++i) {
+        process_body(i, robot_fk_rotations_[i], offset + i * 6);
+      }
+
+      // 3 extended bodies (rotation = parent rotation)
+      for (int e = 0; e < NUM_EXTENDED_BODIES; ++e) {
+        auto robot_ext_rot = ComputeExtendedBodyRot(e);
+        int ext_body_idx = NUM_FK_BODIES + e;
+        process_body(ext_body_idx, robot_ext_rot, offset + (NUM_FK_BODIES + e) * 6);
       }
       return true;
     }
@@ -1788,7 +2060,20 @@ class G1Deploy {
               {"his_body_joint_velocities_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointVelocities(buf, offset, 10, 1); }},
               {"his_last_actions_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherHisLastActions(buf, offset, 10, 1); }},
               {"his_base_angular_velocity_10frame_step1", 30, [this](std::vector<double>& buf, size_t offset) { return GatherHisBaseAngularVelocity(buf, offset, 10, 1); }},
-              {"his_gravity_dir_10frame_step1", 30, [this](std::vector<double>& buf, size_t offset) { return GatherHisGravityDir(buf, offset, 10, 1); }}};
+              {"his_gravity_dir_10frame_step1", 30, [this](std::vector<double>& buf, size_t offset) { return GatherHisGravityDir(buf, offset, 10, 1); }},
+              // 25-frame history variants (for MoE student distill policy)
+              {"his_base_angular_velocity_25frame_step1", 75, [this](std::vector<double>& buf, size_t offset) { return GatherHisBaseAngularVelocity(buf, offset, 25, 1); }},
+              {"his_body_joint_positions_25frame_step1", 725, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointPositions(buf, offset, 25, 1); }},
+              {"his_body_joint_velocities_25frame_step1", 725, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointVelocities(buf, offset, 25, 1); }},
+              {"his_last_actions_25frame_step1", 725, [this](std::vector<double>& buf, size_t offset) { return GatherHisLastActions(buf, offset, 25, 1); }},
+              {"his_gravity_dir_25frame_step1", 75, [this](std::vector<double>& buf, size_t offset) { return GatherHisGravityDir(buf, offset, 25, 1); }},
+              // 20-frame future motion variants with step 2 (for MoE student distill policy)
+              {"motion_joint_positions_20frame_step2", 580, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 20, 2); }},
+              {"motion_joint_velocities_20frame_step2", 580, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 20, 2); }},
+              {"motion_anchor_orientation_20frame_step2", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 20, 2); }},
+              // Body diff observations (robot FK vs reference motion, 30 tracked + 3 extended = 33 bodies)
+              {"diff_body_pos_b", 99, [this](std::vector<double>& buf, size_t offset) { return GatherDiffBodyPosB(buf, offset); }},
+              {"diff_body_tannorm_pb", 198, [this](std::vector<double>& buf, size_t offset) { return GatherDiffBodyTannormPB(buf, offset); }}};
     }
     
     // Initialize observation functions
@@ -1979,17 +2264,60 @@ class G1Deploy {
     bool GatherObservations() {
       // Clear observation buffer
       std::fill(obs_buffer_.begin(), obs_buffer_.end(), 0.0);
-      
+
       // Process observations using pre-built active functions (no map lookup needed!)
       for (const auto& active_obs : active_obs_functions_) {
         bool success = active_obs.function(obs_buffer_, active_obs.offset);
-        
+
         if (!success) {
           std::cout << "Error: Failed to gather observation: " << active_obs.name << std::endl;
           return false;
         }
       }
-      
+
+      // DEBUG: Print each obs term every N ticks (set DUMP_OBS_EVERY=0 to disable)
+      static int debug_tick = 0;
+      static const int DUMP_OBS_EVERY = []() {
+        const char* env = std::getenv("DUMP_OBS_EVERY");
+        return env ? std::max(0, std::atoi(env)) : 100;
+      }();
+      if (DUMP_OBS_EVERY > 0 && (debug_tick++ % DUMP_OBS_EVERY == 0)) {
+        std::cout << "\n========== OBS DUMP (tick " << debug_tick << ") ==========" << std::endl;
+        std::cout << std::fixed << std::setprecision(4);
+        for (const auto& active_obs : active_obs_functions_) {
+          double mn = std::numeric_limits<double>::infinity();
+          double mx = -std::numeric_limits<double>::infinity();
+          double sum = 0.0, sum_sq = 0.0;
+          size_t n_zero = 0;
+          for (size_t k = 0; k < active_obs.dimension; ++k) {
+            double v = obs_buffer_[active_obs.offset + k];
+            mn = std::min(mn, v); mx = std::max(mx, v);
+            sum += v; sum_sq += v * v;
+            if (std::abs(v) < 1e-12) ++n_zero;
+          }
+          double mean = sum / active_obs.dimension;
+          double std_dev = std::sqrt(std::max(0.0, sum_sq / active_obs.dimension - mean * mean));
+          std::cout << "[" << active_obs.name << "] dim=" << active_obs.dimension
+                    << " off=" << active_obs.offset
+                    << " min=" << mn << " max=" << mx
+                    << " mean=" << mean << " std=" << std_dev
+                    << " zeros=" << n_zero << "/" << active_obs.dimension << std::endl;
+          std::cout << "  first 8: [";
+          size_t show = std::min<size_t>(8, active_obs.dimension);
+          for (size_t k = 0; k < show; ++k) {
+            std::cout << obs_buffer_[active_obs.offset + k] << (k + 1 < show ? ", " : "");
+          }
+          std::cout << "]" << std::endl;
+          std::cout << "  last  8: [";
+          size_t start = active_obs.dimension > 8 ? active_obs.dimension - 8 : 0;
+          for (size_t k = start; k < active_obs.dimension; ++k) {
+            std::cout << obs_buffer_[active_obs.offset + k] << (k + 1 < active_obs.dimension ? ", " : "");
+          }
+          std::cout << "]" << std::endl;
+        }
+        std::cout << "========== END OBS DUMP ==========\n" << std::endl;
+      }
+
       return true;
     }
 
@@ -2156,7 +2484,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool dex_rl_lab = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2174,6 +2503,7 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        dex_rl_lab_mode_(dex_rl_lab),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2375,6 +2705,24 @@ class G1Deploy {
         is_using_encoder_ = false;
       }
       
+      // =========================================================================
+      // Initialize RobotFK for runtime body position computation
+      // =========================================================================
+      // Used by diff_body_pos_b and diff_body_tannorm_pb observations.
+      // Loads the same MuJoCo XML used by the motion data reader.
+      {
+        std::string fk_xml_path = "g1/g1_29dof.xml";
+        try {
+          robot_fk_ = std::make_unique<RobotFK>(fk_xml_path);
+          std::cout << "✓ RobotFK loaded from " << fk_xml_path
+                    << " (" << robot_fk_->NumJoints() << " bodies)" << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "⚠ Warning: Failed to load RobotFK from " << fk_xml_path
+                    << ": " << e.what() << std::endl;
+          std::cerr << "  diff_body_pos_b / diff_body_tannorm_pb observations will not work." << std::endl;
+        }
+      }
+
       // =========================================================================
       // Initialize encode_mode for all loaded reference motions and planner motion
       // =========================================================================
@@ -2730,12 +3078,13 @@ class G1Deploy {
         return false;
       }
       MotorCommand motor_command_tmp;
+      const auto& standup_angles = dex_rl_lab_mode_ ? default_angles_dex_rl_lab : default_angles;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i]);
+        motor_command_tmp.q_target.at(i) = static_cast<float>(standup_angles[i]);
         motor_command_tmp.dq_target.at(i) = 0.0;
-        motor_command_tmp.kp.at(i) = kps[i];
-        motor_command_tmp.kd.at(i) = kds[i];
+        motor_command_tmp.kp.at(i) = dex_rl_lab_mode_ ? kps_dex_rl_lab[i] : kps[i];
+        motor_command_tmp.kd.at(i) = dex_rl_lab_mode_ ? kds_dex_rl_lab[i] : kds[i];
       }
       time_ += control_dt_;
       if (time_ < duration_) {
@@ -2743,7 +3092,7 @@ class G1Deploy {
           double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
           double current_pos = ls->motor_state()[i].q();
           motor_command_tmp.q_target.at(i) =
-              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+              static_cast<float>(current_pos * (1.0 - ratio) + standup_angles[i] * ratio);
         }
         dex3_hands_.close(true);
         dex3_hands_.close(false);
@@ -2822,10 +3171,18 @@ class G1Deploy {
       std::array<double, G1_NUM_MOTOR * 2> motor_temperature = {0.0};
       std::array<double, G1_NUM_MOTOR> motor_error = {0.0};
       std::array<double, G1_NUM_MOTOR> motor_torque = {0.0};
+      const auto& active_default_angles = dex_rl_lab_mode_ ? default_angles_dex_rl_lab : default_angles;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        body_q[i] =
-            unitree_joint_state[mujoco_to_isaaclab[i]].q() - default_angles[mujoco_to_isaaclab[i]]; // URDF order
-        body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq(); // URDF order
+        if (dex_rl_lab_mode_) {
+          // IsaacLab/SDK order: body_q[i] = joint i in IsaacLab order
+          body_q[i] = unitree_joint_state[i].q() - active_default_angles[i];
+          body_dq[i] = unitree_joint_state[i].dq();
+        } else {
+          // MuJoCo/URDF order (original SONIC pipeline)
+          body_q[i] = unitree_joint_state[mujoco_to_isaaclab[i]].q() - active_default_angles[mujoco_to_isaaclab[i]];
+          body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq();
+        }
+        // Safety check: use the value regardless of ordering
         if (body_dq[i] > 35 && !disable_crc_check_) {
           std::cout << "✗ Error: body_dq[" << i << "] = " << body_dq[i] << " > 35."
                     << std::endl;
@@ -3116,13 +3473,21 @@ class G1Deploy {
       float* floatarr = action_buffer.data();
       
       MotorCommand motor_command_tmp;
+      const auto& cmd_default_angles = dex_rl_lab_mode_ ? default_angles_dex_rl_lab : default_angles;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
+        double action_value;
+        if (dex_rl_lab_mode_) {
+          // DEX_RL_LAB: policy output is in IsaacLab order, uniform scale 0.25
+          action_value = static_cast<double>(floatarr[i]) * 0.25;
+        } else {
+          // SONIC: policy output is in MuJoCo order, per-joint action scale
+          action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
+        }
         last_action[i] = static_cast<double>(floatarr[i]);
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        motor_command_tmp.q_target.at(i) = static_cast<float>(cmd_default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.kp.at(i) = kps[i];
-        motor_command_tmp.kd.at(i) = kds[i];
+        motor_command_tmp.kp.at(i) = dex_rl_lab_mode_ ? kps_dex_rl_lab[i] : kps[i];
+        motor_command_tmp.kd.at(i) = dex_rl_lab_mode_ ? kds_dex_rl_lab[i] : kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -4134,6 +4499,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --dex-rl-lab: enable DEX_RL_LAB mode (IsaacLab joint order, uniform action scale 0.25," << std::endl;
+    std::cout << "                DEX_RL_LAB default angles, obs scaling: base_ang_vel*0.2, joint_vel*0.05)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4177,6 +4544,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool dexRlLab = false; // DEX_RL_LAB mode: IsaacLab joint order, uniform action scale, matching default angles
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4386,6 +4754,9 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --set-compliance requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--dex-rl-lab") {
+      dexRlLab = true;
+      std::cout << "[INFO] DEX_RL_LAB mode enabled: IsaacLab joint order, uniform action scale 0.25, DEX_RL_LAB default angles, obs scaling" << std::endl;
     } else if (std::string(argv[i]) == "--max-close-ratio") {
       if (i + 1 < argc) {
         try {
@@ -4438,7 +4809,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    dexRlLab
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
