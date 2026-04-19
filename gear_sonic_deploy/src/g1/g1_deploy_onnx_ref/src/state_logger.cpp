@@ -186,10 +186,13 @@ std::vector<Entry> StateLogger::GetLatest(size_t n, bool newest_first) const {
     size_t idx = (start_ + size_ - 1 - i + capacity_) % capacity_;
     out.push_back(ring_[idx]);
   }
-  // Pad with zeros if requested more than available
+  // Pad with the oldest available entry to match IsaacLab CircularBuffer,
+  // which initializes the history buffer by broadcasting the first append to
+  // all slots. If no real entries exist, fall back to zero entries.
   if (out.size() < n) {
     const size_t missing = n - out.size();
-    for (size_t i = 0; i < missing; ++i) { out.push_back(makeZeroEntry_()); }
+    const Entry pad_entry = out.empty() ? makeZeroEntry_() : out.back();
+    for (size_t i = 0; i < missing; ++i) { out.push_back(pad_entry); }
   }
   // Reverse if oldest_first requested
   if (!newest_first) { std::reverse(out.begin(), out.end()); }
@@ -223,10 +226,12 @@ std::vector<Entry> StateLogger::GetLatest(size_t n, double sample_dt_seconds, bo
         const size_t idx = (start_ + size_ - 1 - offset + capacity_) % capacity_;
         out.push_back(ring_[idx]);
       }
-      // Pad with zeros if requested more than available
+      // Pad with the oldest available entry to match IsaacLab CircularBuffer
+      // first-push broadcast (initializes all history slots with the first obs).
       if (out.size() < n) {
         const size_t missing = n - out.size();
-        for (size_t k = 0; k < missing; ++k) { out.push_back(makeZeroEntry_()); }
+        const Entry pad_entry = out.empty() ? makeZeroEntry_() : out.back();
+        for (size_t k = 0; k < missing; ++k) { out.push_back(pad_entry); }
       }
       // Reverse if oldest_first requested
       if (!newest_first) { std::reverse(out.begin(), out.end()); }
@@ -254,10 +259,12 @@ std::vector<Entry> StateLogger::GetLatest(size_t n, double sample_dt_seconds, bo
     i = (i + capacity_ - 1) % capacity_;
     scanned += 1;
   }
-  // Pad with zeros if requested more than available
+  // Pad with the oldest available entry to match IsaacLab CircularBuffer
+  // first-push broadcast (initializes all history slots with the first obs).
   if (out.size() < n) {
     const size_t missing = n - out.size();
-    for (size_t k = 0; k < missing; ++k) { out.push_back(makeZeroEntry_()); }
+    const Entry pad_entry = out.empty() ? makeZeroEntry_() : out.back();
+    for (size_t k = 0; k < missing; ++k) { out.push_back(pad_entry); }
   }
   // Reverse if oldest_first requested
   if (!newest_first) { std::reverse(out.begin(), out.end()); }
