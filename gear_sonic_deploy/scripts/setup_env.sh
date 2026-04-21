@@ -141,7 +141,8 @@ for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
             export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
             echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
             export HAS_ROS2=1
-            export ROS_LOCALHOST_ONLY=1
+            #export ROS_LOCALHOST_ONLY=1
+            unset ROS_LOCALHOST_ONLY
             ROS2_FOUND=true
             break
         fi

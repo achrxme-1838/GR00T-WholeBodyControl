@@ -59,6 +59,8 @@ set(ESSENTIAL_LIB_PATTERNS
   "librcpputils.so*" "librcutils.so*" "librmw.so*"
   "librmw_implementation.so*" "librmw_fastrtps_cpp.so*"
   "libstd_msgs__rosidl_typesupport_cpp.so*" "libstd_msgs__rosidl_generator_cpp.so*"
+  "libnav_msgs__rosidl_typesupport_cpp.so*" "libnav_msgs__rosidl_generator_cpp.so*"
+  "libgeometry_msgs__rosidl_typesupport_cpp.so*" "libgeometry_msgs__rosidl_generator_cpp.so*"
   "librosidl_typesupport_cpp.so*" "librosidl_runtime_cpp.so*" "librosidl_runtime_c.so*"
   "libbuiltin_interfaces__rosidl_typesupport_cpp.so*" "libbuiltin_interfaces__rosidl_generator_cpp.so*"
   "libstatistics_msgs__rosidl_typesupport_cpp.so*" "libstatistics_msgs__rosidl_generator_cpp.so*"

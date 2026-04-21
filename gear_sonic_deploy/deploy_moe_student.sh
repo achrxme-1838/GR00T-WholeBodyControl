@@ -216,8 +216,14 @@ INTERFACE_MODE="real"
 # OBS_CONFIG_DEFAULT="policy/moe_student_test/observation_config.yaml"
 # POLICY_DEFAULT="policy/moe_student_test_2nd/student.onnx"
 # OBS_CONFIG_DEFAULT="policy/moe_student_test_2nd/observation_config.yaml"
-POLICY_DEFAULT="policy/moe_student_test_3rd/student.onnx"
-OBS_CONFIG_DEFAULT="policy/moe_student_test_3rd/observation_config.yaml"
+# POLICY_DEFAULT="policy/moe_student_test_3rd/student.onnx"
+# OBS_CONFIG_DEFAULT="policy/moe_student_test_3rd/observation_config.yaml"
+# POLICY_DEFAULT="policy/moe_student_test_4th/student_push.onnx"
+# OBS_CONFIG_DEFAULT="policy/moe_student_test_4th/observation_config.yaml"
+
+POLICY_DEFAULT="policy/moe_student_test_6th/student.onnx"
+OBS_CONFIG_DEFAULT="policy/moe_student_test_6th/observation_config.yaml"
+
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
 # MOTION_DATA_DEFAULT="reference/example/"
 # Accepts any of:
@@ -423,6 +429,10 @@ dir_has_csv_motions() {
 }
 
 # Hash the source path + mtime so the cache key changes when source files do.
+# Bump GMR_CSV_SCHEMA_VERSION whenever convert_gmr_motions.py changes its
+# output layout (e.g. adding bodies) so stale caches are automatically
+# invalidated without requiring manual cleanup.
+GMR_CSV_SCHEMA_VERSION="v2-33body"
 gmr_cache_key() {
     local src="$1"
     local stamp
@@ -431,7 +441,7 @@ gmr_cache_key() {
     else
         stamp=$(stat -c '%n:%Y' "$src" 2>/dev/null)
     fi
-    printf '%s' "$stamp" | sha1sum | awk '{print $1}' | cut -c1-12
+    printf '%s|%s' "$GMR_CSV_SCHEMA_VERSION" "$stamp" | sha1sum | awk '{print $1}' | cut -c1-12
 }
 
 convert_gmr_if_needed() {
@@ -467,9 +477,18 @@ convert_gmr_if_needed() {
         echo -e "${GREEN}Using cached GMR conversion: $out_dir${NC}" >&2
     else
         echo -e "${YELLOW}Converting GMR motions -> CSV: $src -> $out_dir${NC}" >&2
+        # Nuke any pre-existing empty/partial cache so we always start clean
+        rm -rf "$out_dir"
         mkdir -p "$out_dir"
         if ! python3 "$GMR_CONVERTER_DEFAULT" "$src" "$out_dir" --fps "$GMR_FPS_DEFAULT" >&2; then
             echo -e "${RED}GMR conversion failed${NC}" >&2
+            rm -rf "$out_dir"
+            return 1
+        fi
+        # Guard against python exiting 0 without producing any CSVs
+        if ! dir_has_csv_motions "$out_dir"; then
+            echo -e "${RED}GMR conversion produced no CSV motions in $out_dir${NC}" >&2
+            rm -rf "$out_dir"
             return 1
         fi
     fi

@@ -219,3 +219,5 @@ sonic_release/
 gear_sonic_deploy/bones_seed_smpl/*
 gear_sonic_deploy/media/*
 
+gear_sonic_deploy/reference/GMR/*
+gear_sonic_deploy/policy/*

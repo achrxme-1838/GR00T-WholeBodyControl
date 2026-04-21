@@ -4,7 +4,7 @@
 # No token_state, no encoder.
 #
 # Order MUST match PolicyCfg in g1_29dof_sonic_distill.py exactly.
-# Total dimension: 3902
+# Total dimension: 2615
 #
 # Proprioception history (25 frames):
 #   base_ang_vel:      3 x 25 =   75
@@ -13,14 +13,8 @@
 #   last_action:      29 x 25 =  725
 #   projected_gravity: 3 x 25 =   75
 #
-# Future motion reference (20 frames, step 2):
-#   future_motion_joint_pos:  29 x 20 = 580
-#   future_motion_joint_vel:  29 x 20 = 580
-#   future_motion_anchor:      6 x 20 = 120
-#
-# Current-frame body diffs (30 tracked + 3 extended = 33 bodies):
-#   diff_body_pos_b:     33 x 3 =  99
-#   diff_body_tannorm_pb: 33 x 6 = 198
+# Future motion reference (10 frames, step 5):
+#   future_motion_joint_pos:  29 x 10 = 290
 
 observations:
 
@@ -43,5 +37,3 @@ observations:
 
   - name: "motion_joint_positions_10frame_step5"
     enabled: true
-
-

@@ -13,13 +13,25 @@ GMR pkl schema (produced by General Motion Retargeting for G1 29DOF):
 
 Output CSV layout (per motion):
     joint_pos.csv, joint_vel.csv      in IsaacLab joint order (29 dof)
-    body_pos.csv, body_quat.csv       14 bodies in world frame
+    body_pos.csv, body_quat.csv       33 bodies in world frame
     body_lin_vel.csv, body_ang_vel.csv (finite-diff + Gaussian filter)
     metadata.txt, info.txt
 
-The 14-body layout matches existing example motions exactly:
-    IsaacLab body indexes : [0 4 10 18 5 11 19 9 16 22 28 17 23 29]
-    MuJoCo   body indexes : [1 3  5  7 9 11 13 16 18 20 23 25 27 30]
+The 33-body layout matches the deploy FK order (TRACKED_BODY_NAMES in
+g1_29dof_sonic_distill.py) + 3 extended bodies:
+    FK bodies 0..29     : MuJoCo body indices 1..30
+                          (pelvis + left leg(6) + right leg(6) + waist+torso(3)
+                           + left arm(7) + right arm(7) = 30)
+    extended body 30    : left_hand_link_ext  (parent=left_wrist_yaw_link  [22],
+                                               offset=(0.0415,  0.003, 0.0))
+    extended body 31    : right_hand_link_ext (parent=right_wrist_yaw_link [29],
+                                               offset=(0.0415, -0.003, 0.0))
+    extended body 32    : head_link_ext       (parent=torso_link           [15],
+                                               offset=(0.0,     0.0,  0.4))
+
+Deploy uses `_body_indexes[j] == i` to locate FK body `i` (0..29) or extended
+body `NUM_FK_BODIES + e` (30..32) in the motion CSV; writing an identity
+`_body_indexes = [0, 1, ..., 32]` satisfies this lookup for all 33 bodies.
 
 Usage:
     python3 convert_gmr_motions.py <pkl_file_or_dir> [output_dir] [--fps 50]
@@ -31,10 +43,25 @@ import sys
 
 import numpy as np
 
-# 14 target bodies in MuJoCo body index order (verified against
-# reference/example row 0 with exact match via mj_forward).
-MJ_BODY_IDX_14 = np.array([1, 3, 5, 7, 9, 11, 13, 16, 18, 20, 23, 25, 27, 30], dtype=np.int64)
-IL_BODY_IDX_14 = np.array([0, 4, 10, 18, 5, 11, 19, 9, 16, 22, 28, 17, 23, 29], dtype=np.int64)
+# 30 FK bodies in MuJoCo body index order. Verified via mj_id2name that
+# MJ body 1..30 == TRACKED_BODY_NAMES[0..29] exactly.
+NUM_FK_BODIES = 30
+NUM_EXTENDED_BODIES = 3
+NUM_TOTAL_BODIES = NUM_FK_BODIES + NUM_EXTENDED_BODIES  # 33
+
+MJ_BODY_IDX_30 = np.arange(1, NUM_FK_BODIES + 1, dtype=np.int64)
+
+# Extended body definitions: (parent_fk_idx, offset_xyz) — must match
+# extended_body_defs_ in g1_deploy_onnx_ref.cpp and SMPLCfg.extending.extended_joints.
+EXTENDED_BODY_DEFS = [
+    (22, np.array([0.0415,  0.003, 0.0], dtype=np.float64)),   # left_hand_link_ext
+    (29, np.array([0.0415, -0.003, 0.0], dtype=np.float64)),   # right_hand_link_ext
+    (15, np.array([0.0,     0.0,   0.4], dtype=np.float64)),   # head_link_ext
+]
+
+# `_body_indexes` written to metadata is positional in the tracked+extended
+# order, so deploy's `motion_body_indexes[j] == i` lookup is an identity map.
+BODY_INDEX_33 = np.arange(NUM_TOTAL_BODIES, dtype=np.int64)
 
 # Mapping between IsaacLab joint order and the motion-CSV ("Unitree SDK /
 # mujoco-interleaved") order expected by the C++ deploy binary. Must mirror
@@ -160,6 +187,41 @@ def _compute_world_fk(model, data, root_pos, root_quat_wxyz, dof_pos_mj, mj_body
     return body_pos, body_quat
 
 
+def _append_extended_bodies(body_pos_fk, body_quat_fk):
+    """Append the 3 extended bodies to FK arrays.
+
+    Extended body pose:
+        pos = parent_pos + quat_rotate(parent_quat, offset)
+        rot = parent_rot  (child shares parent rotation, matches deploy
+              ComputeExtendedBodyRot)
+    """
+    T, K_fk, _ = body_pos_fk.shape
+    assert K_fk == NUM_FK_BODIES, f"expected {NUM_FK_BODIES} FK bodies, got {K_fk}"
+
+    body_pos = np.zeros((T, NUM_TOTAL_BODIES, 3), dtype=np.float64)
+    body_quat = np.zeros((T, NUM_TOTAL_BODIES, 4), dtype=np.float64)
+    body_pos[:, :K_fk] = body_pos_fk
+    body_quat[:, :K_fk] = body_quat_fk
+
+    for e, (parent_idx, offset) in enumerate(EXTENDED_BODY_DEFS):
+        parent_pos = body_pos_fk[:, parent_idx]          # (T, 3)
+        parent_quat = body_quat_fk[:, parent_idx]        # (T, 4) wxyz
+        # Rotate local offset by parent quaternion (world-frame offset)
+        offset_rot = _quat_rotate_wxyz(parent_quat, np.broadcast_to(offset, parent_pos.shape))
+        body_pos[:, K_fk + e] = parent_pos + offset_rot
+        body_quat[:, K_fk + e] = parent_quat
+
+    return body_pos, body_quat
+
+
+def _quat_rotate_wxyz(q, v):
+    """Rotate vectors v by quaternions q (wxyz). Shapes: q (..., 4), v (..., 3)."""
+    w = q[..., 0:1]
+    xyz = q[..., 1:4]
+    t = 2.0 * np.cross(xyz, v)
+    return v + w * t + np.cross(xyz, t)
+
+
 def _quat_mul_wxyz(q1, q2):
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
     w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
@@ -243,21 +305,32 @@ def _save_csv(path, array, headers):
             f.write(",".join(f"{v:.6f}" for v in row) + "\n")
 
 
-def _write_metadata(path, motion_name, T, body_indexes_il):
+def _write_metadata(path, motion_name, T, body_indexes):
+    K = len(body_indexes)
+    # The deploy metadata reader consumes exactly one line after
+    # "Body part indexes:" and regex-matches \d+ tokens, so the whole array
+    # MUST fit on a single line. np.array2string wraps by default at ~75 cols
+    # (which silently truncated bodies 24+ on 33-body metadata).
+    body_idx_str = np.array2string(
+        np.asarray(body_indexes),
+        separator=" ",
+        max_line_width=10_000,
+        threshold=10_000,
+    )
     with open(path, "w") as f:
         f.write(f"Metadata for: {motion_name}\n")
         f.write("=" * 30 + "\n\n")
         f.write("Body part indexes:\n")
-        f.write(f"{np.array2string(body_indexes_il)}\n\n")
+        f.write(f"{body_idx_str}\n\n")
         f.write(f"Total timesteps: {T}\n\n")
         f.write("Data arrays summary:\n")
         f.write(f"  joint_pos: ({T}, 29) (float32)\n")
         f.write(f"  joint_vel: ({T}, 29) (float32)\n")
-        f.write(f"  body_pos_w: ({T}, 14, 3) (float32)\n")
-        f.write(f"  body_quat_w: ({T}, 14, 4) (float32)\n")
-        f.write(f"  body_lin_vel_w: ({T}, 14, 3) (float32)\n")
-        f.write(f"  body_ang_vel_w: ({T}, 14, 3) (float32)\n")
-        f.write(f"  _body_indexes: (14,) (int64)\n")
+        f.write(f"  body_pos_w: ({T}, {K}, 3) (float32)\n")
+        f.write(f"  body_quat_w: ({T}, {K}, 4) (float32)\n")
+        f.write(f"  body_lin_vel_w: ({T}, {K}, 3) (float32)\n")
+        f.write(f"  body_ang_vel_w: ({T}, {K}, 3) (float32)\n")
+        f.write(f"  _body_indexes: ({K},) (int64)\n")
         f.write(f"  time_step_total: () (int64)\n")
 
 
@@ -299,10 +372,16 @@ def convert_one_motion(motion_name, gmr, output_dir, model, data, target_fps, fi
 
     T = root_pos.shape[0]
 
-    # Forward kinematics -> world body pose
-    body_pos, body_quat_wxyz = _compute_world_fk(model, data, root_pos, root_rot_wxyz, dof_pos_mj, MJ_BODY_IDX_14)
+    # Forward kinematics -> world body pose for 30 FK bodies,
+    # then append 3 extended bodies (parent pose + rotated offset).
+    body_pos_fk, body_quat_fk = _compute_world_fk(
+        model, data, root_pos, root_rot_wxyz, dof_pos_mj, MJ_BODY_IDX_30
+    )
+    body_pos, body_quat_wxyz = _append_extended_bodies(body_pos_fk, body_quat_fk)
 
-    # Finite-diff body velocities (matches C++ ComputeGlobalVelocities)
+    # Finite-diff body velocities (matches C++ ComputeGlobalVelocities).
+    # Computed on the extended 33-body arrays so extended bodies get proper
+    # velocities from the parent+offset trajectory.
     body_lin_vel, body_ang_vel = _compute_body_velocities(body_pos, body_quat_wxyz, eff_fps, filter=filter_vel)
 
     # GMR pkl's dof_pos is in chain order == IsaacLab joint order.
@@ -344,7 +423,7 @@ def convert_one_motion(motion_name, gmr, output_dir, model, data, target_fps, fi
     _save_csv(os.path.join(output_dir, "body_ang_vel.csv"), body_ang_vel.reshape(T, -1),
               [f"body_{b}_angvel_{c}" for b in range(K) for c in "xyz"])
 
-    _write_metadata(os.path.join(output_dir, "metadata.txt"), motion_name, T, IL_BODY_IDX_14)
+    _write_metadata(os.path.join(output_dir, "metadata.txt"), motion_name, T, BODY_INDEX_33)
     _write_info(
         os.path.join(output_dir, "info.txt"),
         motion_name,
@@ -355,7 +434,7 @@ def convert_one_motion(motion_name, gmr, output_dir, model, data, target_fps, fi
             "body_quat_w": body_quat_wxyz,
             "body_lin_vel_w": body_lin_vel,
             "body_ang_vel_w": body_ang_vel,
-            "_body_indexes": IL_BODY_IDX_14,
+            "_body_indexes": BODY_INDEX_33,
         },
     )
 

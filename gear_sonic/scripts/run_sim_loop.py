@@ -10,6 +10,7 @@ import tyro
 
 from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
 from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
+from gear_sonic.utils.mujoco_sim.ros2_pose_publisher import MujocoOdometryPublisher
 from gear_sonic.data.robot_model.instantiation.g1 import (
     instantiate_g1_robot_model,
 )
@@ -53,14 +54,27 @@ def main(config: ArgsConfig):
         offscreen=wbc_config.get("ENABLE_OFFSCREEN", False),
         enable_image_publish=config.enable_image_publish,
     )
-    # Start simulator as independent process
-    SimulatorFactory.start_simulator(
-        sim_wrapper.sim,
-        as_thread=False,
-        enable_image_publish=config.enable_image_publish,
-        mp_start_method=config.mp_start_method,
-        camera_port=config.camera_port,
+
+    # Publish MuJoCo GT base pose as FAST-LIO-style /Odometry for the
+    # deploy stack to consume as a substitute for real odometry.
+    odom_publisher = MujocoOdometryPublisher(
+        sim_env=sim_wrapper.sim.sim_env,
+        topic="/Odometry",
+        rate_hz=100.0,
     )
+    odom_publisher.start()
+
+    try:
+        # Start simulator as independent process
+        SimulatorFactory.start_simulator(
+            sim_wrapper.sim,
+            as_thread=False,
+            enable_image_publish=config.enable_image_publish,
+            mp_start_method=config.mp_start_method,
+            camera_port=config.camera_port,
+        )
+    finally:
+        odom_publisher.stop()
 
 
 if __name__ == "__main__":

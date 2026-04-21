@@ -127,6 +127,9 @@
 #include <cuda_runtime.h>
 #include "../include/state_logger.hpp"
 
+// Optional GT odometry subscriber (FAST-LIO-style /Odometry)
+#include "../include/odom_subscriber.hpp"
+
 // Encoder
 #include "../include/encoder.hpp"
 
@@ -420,6 +423,25 @@ class G1Deploy {
       {15, {0.0, 0.0, 0.4}},        // head_link_ext
     }};
 
+    // =========================================================================
+    // GT odometry-based origin frame (anchored at robot world pose at T-press)
+    // =========================================================================
+    // When the operator triggers `play` (false→true transition), we capture the
+    // robot's current world pose (from /Odometry) and the reference motion's
+    // frame-0 root pose. Both robot and motion are then expressed in this
+    // common "origin" frame so that diff_body_pos_b reflects the *real* drift
+    // between robot and motion, instead of forcing root drift to zero.
+    //
+    // Heading-only quaternions are used for the origin so that pitch/roll are
+    // preserved in the body-frame diff (matching apply_delta_heading semantics).
+    std::unique_ptr<OdomSubscriber> odom_sub_;
+    bool origin_set_ = false;
+    bool prev_play_state_ = false;
+    std::array<double, 3> origin_pos_w_ {0.0, 0.0, 0.0};
+    std::array<double, 4> origin_quat_w_heading_ {1.0, 0.0, 0.0, 0.0};
+    std::array<double, 3> motion_origin_pos_w_ {0.0, 0.0, 0.0};
+    std::array<double, 4> motion_origin_quat_w_heading_ {1.0, 0.0, 0.0, 0.0};
+
     // Pre-allocated observation buffers to avoid allocation in control loop
     std::vector<double> obs_buffer_;          // Policy observation buffer
     std::vector<double> encoder_obs_buffer_;  // Encoder observation buffer
@@ -641,6 +663,13 @@ class G1Deploy {
      *   - 0: full base quaternion (existing motion_anchor_ori_b)
      *   - 1: robot heading only (heading setting: motion_anchor_ori_heading)
      *   - 2: reference first-frame heading (refheading setting: motion_anchor_ori_refheading)
+     *   - 3: heading-corrected relative rotation matching Python
+     *        `future_motion_anchor`/`motion_anchor` in mimic_observations.py:
+     *        output_quat = H^-1 * (R * B^-1) * H
+     *        where B = base_quat, R = ref_root_quat, H = planar (heading-only) base_quat.
+     *        NOTE: modes 0/1/2 compute `left_quat^-1 * R`, which does NOT match
+     *        the Python training observation. Use mode 3 for any policy trained
+     *        on `future_motion_anchor`.
      */
     bool GatherMotionAnchorOrientationMutiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, int orientation_mode = 0) {
       if (!current_motion_ || current_motion_->timesteps == 0) {
@@ -696,15 +725,25 @@ class G1Deploy {
         //   0: full base quaternion (motion_anchor_ori_b)
         //   1: robot heading only (motion_anchor_ori_heading)
         //   2: reference first-frame heading (motion_anchor_ori_refheading)
-        std::array<double, 4> left_quat;
-        if (orientation_mode == 1) {
-          left_quat = calc_heading_quat_d(base_quat);
-        } else if (orientation_mode == 2) {
-          left_quat = ref_first_heading;
+        //   3: heading-corrected (matches Python future_motion_anchor):
+        //      H^-1 * (R * B^-1) * H, where H = planar(base_quat)
+        std::array<double, 4> base_to_ref_quat;
+        if (orientation_mode == 3) {
+          auto heading_quat = calc_heading_quat_d(base_quat);
+          auto inv_heading = quat_conjugate_d(heading_quat);
+          auto rel_quat_w = quat_mul_d(new_ref_root_rot, quat_conjugate_d(base_quat));
+          base_to_ref_quat = quat_mul_d(quat_mul_d(inv_heading, rel_quat_w), heading_quat);
         } else {
-          left_quat = base_quat;
+          std::array<double, 4> left_quat;
+          if (orientation_mode == 1) {
+            left_quat = calc_heading_quat_d(base_quat);
+          } else if (orientation_mode == 2) {
+            left_quat = ref_first_heading;
+          } else {
+            left_quat = base_quat;
+          }
+          base_to_ref_quat = quat_mul_d(quat_conjugate_d(left_quat), new_ref_root_rot);
         }
-        auto base_to_ref_quat = quat_mul_d(quat_conjugate_d(left_quat), new_ref_root_rot);
         auto rotation_matrix = quat_to_rotation_matrix_d(base_to_ref_quat);
 
         // Extract first 2 columns of rotation matrix and flatten ROW-WISE to 1D array (6 elements)
@@ -854,7 +893,8 @@ class G1Deploy {
       return true;
     }
     
-    /// Gather joint velocities from N future frames.  Zeroes velocities when not playing.
+    /// Gather joint velocities from N future frames.  Always returns velocities
+    /// regardless of play state to match Python training observation future_motion_joint_vel.
     bool GatherMotionJointVelocitiesMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> joint_indexes = {}) {
       if (!current_motion_ || current_motion_->timesteps == 0) { 
         return false; 
@@ -890,64 +930,50 @@ class G1Deploy {
         // If body part indexes are empty, gather all joints
         if (joint_indexes.empty()) {
           size_t frame_offset = offset + frame_idx * 29;  // 29 joints per frame
-          if (operator_state.play) {
-            // DEX_RL_LAB mode: motion data is in MuJoCo interleaved order, policy expects IsaacLab order
-            if (dex_rl_lab_mode_) {
-              std::array<double, 29> reordered;
-              for (int j = 0; j < 29; j++) {
-                reordered[j] = motion_joint_vel[isaaclab_to_mujoco[j]];
-              }
-              std::copy(reordered.begin(), reordered.end(), target_buffer.begin() + frame_offset);
-            } else {
-              std::copy(
-                motion_joint_vel,
-                motion_joint_vel + num_joints,
-                target_buffer.begin() + frame_offset
-              );
+          // Always gather motion joint velocities regardless of play state — matches
+          // the Python training observation future_motion_joint_vel, which is
+          // unconditional. Zeroing-when-idle produced an OOD observation that
+          // destabilized the policy at deploy time.
+          if (dex_rl_lab_mode_) {
+            std::array<double, 29> reordered;
+            for (int j = 0; j < 29; j++) {
+              reordered[j] = motion_joint_vel[isaaclab_to_mujoco[j]];
             }
-            // If upper body control is enabled, use upper body joint velocities in buffer to replace the motion_joint_vel
-            if (has_upper_body_data_) {
-              std::array<double, 29> current_motion_joint_vel;
-              for (size_t i = 0; i < 29; i++) {
-                current_motion_joint_vel[i] = motion_joint_vel[i];
-              }
-              for (size_t i = 0; i < 17; i++) {
-                current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
-              }
-              std::copy(
-                current_motion_joint_vel.begin(),
-                current_motion_joint_vel.end(),
-                target_buffer.begin() + frame_offset
-              );
-            }
+            std::copy(reordered.begin(), reordered.end(), target_buffer.begin() + frame_offset);
           } else {
-            std::fill_n(
-              target_buffer.begin() + frame_offset,
-              num_joints,
-              0.0
+            std::copy(
+              motion_joint_vel,
+              motion_joint_vel + num_joints,
+              target_buffer.begin() + frame_offset
+            );
+          }
+          if (has_upper_body_data_) {
+            std::array<double, 29> current_motion_joint_vel;
+            for (size_t i = 0; i < 29; i++) {
+              current_motion_joint_vel[i] = motion_joint_vel[i];
+            }
+            for (size_t i = 0; i < 17; i++) {
+              current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
+            }
+            std::copy(
+              current_motion_joint_vel.begin(),
+              current_motion_joint_vel.end(),
+              target_buffer.begin() + frame_offset
             );
           }
         // If body part indexes are not empty, gather only the needed joints
         } else {
-          size_t frame_offset = offset + frame_idx * joint_indexes.size(); 
-          if (operator_state.play) {
-            std::vector<double> needed_joints_vel(joint_indexes.size());
-            for (size_t i = 0; i < joint_indexes.size(); i++) {
-              size_t body_part_index = joint_indexes[i];
-              needed_joints_vel[i] = motion_joint_vel[body_part_index];
-            }
-            std::copy(
-              needed_joints_vel.begin(),
-              needed_joints_vel.end(),
-              target_buffer.begin() + frame_offset
-            );
-          } else {
-            std::fill_n(
-              target_buffer.begin() + frame_offset,
-              joint_indexes.size(),
-              0.0
-            );
+          size_t frame_offset = offset + frame_idx * joint_indexes.size();
+          std::vector<double> needed_joints_vel(joint_indexes.size());
+          for (size_t i = 0; i < joint_indexes.size(); i++) {
+            size_t body_part_index = joint_indexes[i];
+            needed_joints_vel[i] = motion_joint_vel[body_part_index];
           }
+          std::copy(
+            needed_joints_vel.begin(),
+            needed_joints_vel.end(),
+            target_buffer.begin() + frame_offset
+          );
         }
       }
       
@@ -1761,18 +1787,116 @@ class G1Deploy {
     // Bodies: 30 tracked (FK tree) + 3 extended = 33 total.
     // =========================================================================
 
+    // -------------------------------------------------------------------------
+    // Origin-frame helpers (anchored at robot world pose at play=true edge)
+    // -------------------------------------------------------------------------
+
+    /// Detect play=false→true transition and (re)capture the origin frame from
+    /// the latest GT odometry pose and the current motion's frame-0 root pose.
+    /// Heading-only quaternions are used so pitch/roll are preserved when
+    /// rotating into body frame (matches apply_delta_heading semantics).
+    void MaybeCaptureOrigin() {
+      bool play_now = operator_state.play;
+      bool rising_edge = (play_now && !prev_play_state_);
+      prev_play_state_ = play_now;
+      if (!rising_edge) return;
+      if (!odom_sub_ || !odom_sub_->has_data()) {
+        std::cout << "[G1Deploy] T-press: no odometry yet, origin unset (legacy diff fallback)." << std::endl;
+        origin_set_ = false;
+        return;
+      }
+      if (!current_motion_ || current_motion_->GetNumBodies() == 0
+          || current_motion_->GetNumBodyQuaternions() == 0) {
+        origin_set_ = false;
+        return;
+      }
+
+      std::array<double, 3> odom_pos;
+      std::array<double, 4> odom_quat;
+      if (!odom_sub_->get_latest(odom_pos, odom_quat)) {
+        origin_set_ = false;
+        return;
+      }
+
+      origin_pos_w_ = odom_pos;
+      origin_quat_w_heading_ = calc_heading_quat_d(odom_quat);
+
+      const auto motion_root_pos_0 = current_motion_->BodyPositions(0)[0];
+      const auto motion_root_quat_0 = current_motion_->BodyQuaternions(0)[0];
+      motion_origin_pos_w_ = motion_root_pos_0;
+      motion_origin_quat_w_heading_ = calc_heading_quat_d(motion_root_quat_0);
+
+      origin_set_ = true;
+      std::cout << "[G1Deploy] Origin captured at T-press: pos=("
+                << origin_pos_w_[0] << "," << origin_pos_w_[1] << "," << origin_pos_w_[2]
+                << ") heading_quat=(" << origin_quat_w_heading_[0] << ","
+                << origin_quat_w_heading_[1] << "," << origin_quat_w_heading_[2] << ","
+                << origin_quat_w_heading_[3] << ")" << std::endl;
+    }
+
+    /// Transform a world-frame position into origin frame.
+    inline std::array<double, 3> WorldToOriginPos(const std::array<double, 3>& p_w) const {
+      std::array<double, 3> delta = {
+          p_w[0] - origin_pos_w_[0],
+          p_w[1] - origin_pos_w_[1],
+          p_w[2] - origin_pos_w_[2],
+      };
+      return quat_rotate_d(quat_conjugate_d(origin_quat_w_heading_), delta);
+    }
+
+    /// Transform a motion-frame position (in motion's own world frame) into the
+    /// shared origin frame. Motion's frame-0 root is mapped to (0,0,0).
+    inline std::array<double, 3> MotionToOriginPos(const std::array<double, 3>& p_m) const {
+      std::array<double, 3> delta = {
+          p_m[0] - motion_origin_pos_w_[0],
+          p_m[1] - motion_origin_pos_w_[1],
+          p_m[2] - motion_origin_pos_w_[2],
+      };
+      return quat_rotate_d(quat_conjugate_d(motion_origin_quat_w_heading_), delta);
+    }
+
+    /// Transform a motion-frame quaternion into origin frame.
+    inline std::array<double, 4> MotionToOriginQuat(const std::array<double, 4>& q_m) const {
+      return quat_mul_d(quat_conjugate_d(motion_origin_quat_w_heading_), q_m);
+    }
+
+    /// Transform a world-frame quaternion into origin frame.
+    inline std::array<double, 4> WorldToOriginQuat(const std::array<double, 4>& q_w) const {
+      return quat_mul_d(quat_conjugate_d(origin_quat_w_heading_), q_w);
+    }
+
     /// Compute robot FK from current sensor state and store in robot_fk_positions_/rotations_.
     /// Returns false if FK is not available or sensor data is missing.
+    ///
+    /// When `origin_set_` is true and GT odometry is available, the FK output
+    /// is expressed in the origin frame (anchored at the robot's world pose at
+    /// the moment of T-press). Otherwise, falls back to the legacy behavior
+    /// where root_pos = ref_motion_root_pos and FK is in world frame — in
+    /// which case the root translation drift cancels out in the body-frame
+    /// diff (matching the original C++ deploy semantics).
     bool ComputeRobotFK() {
       if (!robot_fk_ || !state_logger_) return false;
       auto hist = state_logger_->GetLatest(1, false);
       if (hist.empty() || hist[0].body_q.empty()) return false;
 
       const auto& entry = hist[0];
-      // Root position: use reference motion root pos as proxy (robot has no position sensor).
-      // This cancels out in the body-frame diff for non-root bodies.
+
       std::array<double, 3> root_pos = {0.0, 0.0, 0.0};
-      if (current_motion_ && current_motion_->GetNumBodies() > 0) {
+      std::array<double, 4> root_quat = entry.base_quat;
+
+      if (origin_set_ && odom_sub_ && odom_sub_->has_data()) {
+        // Origin frame: use GT odometry root pose, transformed to origin frame.
+        std::array<double, 3> odom_pos;
+        std::array<double, 4> odom_quat;
+        if (odom_sub_->get_latest(odom_pos, odom_quat)) {
+          root_pos = WorldToOriginPos(odom_pos);
+          // FK uses the IMU-derived base quat for orientation. Express it in
+          // the origin frame so FK output is consistent with origin-frame pos.
+          root_quat = WorldToOriginQuat(entry.base_quat);
+        }
+      } else if (current_motion_ && current_motion_->GetNumBodies() > 0) {
+        // Legacy fallback: use ref motion root pos as proxy (cancels out in
+        // body-frame diff for non-root bodies).
         root_pos = current_motion_->BodyPositions(current_frame_)[0];
       }
 
@@ -1787,7 +1911,7 @@ class G1Deploy {
           robot_fk_positions_.data(),
           robot_fk_rotations_.data(),
           root_pos,
-          entry.base_quat,
+          root_quat,
           body_q_mujoco.data()
         );
       } else {
@@ -1796,7 +1920,7 @@ class G1Deploy {
           robot_fk_positions_.data(),
           robot_fk_rotations_.data(),
           root_pos,
-          entry.base_quat,
+          root_quat,
           entry.body_q.data()
         );
       }
@@ -1822,6 +1946,14 @@ class G1Deploy {
     /// Gather diff_body_pos_b: (ref_body_pos - robot_body_pos) rotated to robot body frame.
     /// Output: 33 bodies x 3 = 99 values.
     /// Matches Python: diff_body_pos_b in mimic_observations.py
+    ///
+    /// When `origin_set_` is true, both robot FK output (from ComputeRobotFK)
+    /// and reference motion bodies are expressed in the shared origin frame
+    /// (anchored at robot world pose at T-press), so the diff captures real
+    /// drift between robot and motion. The body-frame rotation uses the
+    /// robot's base_quat expressed in the origin frame.
+    /// Otherwise falls back to the legacy world-frame behavior where the
+    /// translation drift cancels out (matching ref_root proxy semantics).
     bool GatherDiffBodyPosB(std::vector<double>& target_buffer, size_t offset) {
       if (!current_motion_ || current_motion_->GetNumBodies() == 0) return false;
       if (!ComputeRobotFK()) return false;
@@ -1829,7 +1961,13 @@ class G1Deploy {
 
       auto hist = state_logger_->GetLatest(1, false);
       if (hist.empty()) return false;
-      auto inv_root_quat = quat_conjugate_d(hist[0].base_quat);
+
+      // Body-frame rotation: when origin is set, robot base_quat must be
+      // expressed in the origin frame (matching FK output frame).
+      std::array<double, 4> robot_root_quat = origin_set_
+          ? WorldToOriginQuat(hist[0].base_quat)
+          : hist[0].base_quat;
+      auto inv_root_quat = quat_conjugate_d(robot_root_quat);
 
       int frame = static_cast<int>(current_frame_);
       if (frame >= static_cast<int>(current_motion_->timesteps))
@@ -1837,6 +1975,11 @@ class G1Deploy {
 
       const auto ref_body_pos = current_motion_->BodyPositions(frame);
       const auto& motion_body_indexes = current_motion_->BodyPartIndexes();
+
+      // Helper: ref body position transformed into the FK output frame.
+      auto ref_pos_in_fk_frame = [&](const std::array<double, 3>& p_m) -> std::array<double, 3> {
+        return origin_set_ ? MotionToOriginPos(p_m) : p_m;
+      };
 
       // 30 tracked FK bodies
       for (int i = 0; i < NUM_FK_BODIES; ++i) {
@@ -1847,10 +1990,11 @@ class G1Deploy {
         }
         std::array<double, 3> diff_w;
         if (storage_idx >= 0) {
+          auto ref_p = ref_pos_in_fk_frame(ref_body_pos[storage_idx]);
           diff_w = {
-            ref_body_pos[storage_idx][0] - robot_fk_positions_[i][0],
-            ref_body_pos[storage_idx][1] - robot_fk_positions_[i][1],
-            ref_body_pos[storage_idx][2] - robot_fk_positions_[i][2],
+            ref_p[0] - robot_fk_positions_[i][0],
+            ref_p[1] - robot_fk_positions_[i][1],
+            ref_p[2] - robot_fk_positions_[i][2],
           };
         } else {
           diff_w = {0.0, 0.0, 0.0};
@@ -1872,10 +2016,11 @@ class G1Deploy {
         }
         std::array<double, 3> diff_w;
         if (storage_idx >= 0) {
+          auto ref_p = ref_pos_in_fk_frame(ref_body_pos[storage_idx]);
           diff_w = {
-            ref_body_pos[storage_idx][0] - robot_ext_pos[0],
-            ref_body_pos[storage_idx][1] - robot_ext_pos[1],
-            ref_body_pos[storage_idx][2] - robot_ext_pos[2],
+            ref_p[0] - robot_ext_pos[0],
+            ref_p[1] - robot_ext_pos[1],
+            ref_p[2] - robot_ext_pos[2],
           };
         } else {
           diff_w = {0.0, 0.0, 0.0};
@@ -1906,8 +2051,14 @@ class G1Deploy {
       auto hist = state_logger_->GetLatest(1, false);
       if (hist.empty()) return false;
 
-      // Planar root quat = heading-only quaternion from robot base
-      auto planar_root_quat = calc_heading_quat_d(hist[0].base_quat);
+      // When origin is set, robot FK rotations are in the origin frame, so
+      // the planar root quat must also be derived from the robot base quat
+      // expressed in the origin frame (otherwise the body-frame projection
+      // is inconsistent with the FK output frame).
+      std::array<double, 4> robot_root_quat = origin_set_
+          ? WorldToOriginQuat(hist[0].base_quat)
+          : hist[0].base_quat;
+      auto planar_root_quat = calc_heading_quat_d(robot_root_quat);
       auto inv_planar = quat_conjugate_d(planar_root_quat);
 
       int frame = static_cast<int>(current_frame_);
@@ -1935,10 +2086,14 @@ class G1Deploy {
         }
         std::array<double, 6> tannorm;
         if (storage_idx >= 0) {
-          auto ref_quat = ref_body_quat[storage_idx];
-          // diff_quat_w = ref_quat * conjugate(robot_quat)
+          // When origin is set, ref body quaternions must be expressed in the
+          // origin frame (matching FK rotation output frame).
+          auto ref_quat = origin_set_
+              ? MotionToOriginQuat(ref_body_quat[storage_idx])
+              : ref_body_quat[storage_idx];
+          // diff_quat = ref_quat * conjugate(robot_quat)  (in shared frame)
           auto diff_quat_w = quat_mul_d(ref_quat, quat_conjugate_d(robot_quat));
-          // diff_quat_pb = inv_planar * diff_quat_w * planar_root_quat
+          // diff_quat_pb = inv_planar * diff_quat * planar_root_quat
           auto diff_quat_pb = quat_mul_d(quat_mul_d(inv_planar, diff_quat_w), planar_root_quat);
           tannorm = quat_to_tannorm(diff_quat_pb);
         } else {
@@ -1981,13 +2136,18 @@ class G1Deploy {
               {"encoder_mode_4", 4, [this](std::vector<double>& buf, size_t offset) { return GatherEncoderMode(buf, offset, 3); }},
               {"motion_joint_positions", 29, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 1, 1); }},
               {"motion_joint_velocities", 29, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 1, 1); }},
-              {"motion_anchor_orientation", 6, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 1, 1); }},
+              // motion_anchor_orientation / *_10frame_* use mode 3 to match
+              // Python future_motion_anchor (heading-corrected H^-1 * R * B^-1 * H).
+              // Previous implementation used mode 0 (B^-1 * R), which is NOT
+              // the training distribution and caused OOD observations on the
+              // MoE student distill policies.
+              {"motion_anchor_orientation", 6, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 1, 1, 3); }},
               {"motion_root_z_position", 1, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 1, 1); }},
               {"motion_root_z_position_10frame_step5", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 5); }},
               {"motion_root_z_position_10frame_step1", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 1); }},
               {"motion_root_z_position_3frame_step1", 3, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 3, 1); }},
-              {"motion_anchor_orientation_10frame_step5", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 5); }},
-              {"motion_anchor_orientation_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1); }},
+              {"motion_anchor_orientation_10frame_step5", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 5, 3); }},
+              {"motion_anchor_orientation_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 3); }},
               // Heading-only variants (mode=1): use robot yaw-only quaternion
               // Matches Python heading setting: quat_mul(quat_inv(get_heading_q(robot_pelvis_quat)), ref_quat)
               {"motion_anchor_orientation_heading", 6, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 1, 1, 1); }},
@@ -2070,7 +2230,7 @@ class G1Deploy {
               // 20-frame future motion variants with step 2 (for MoE student distill policy)
               {"motion_joint_positions_20frame_step2", 580, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 20, 2); }},
               {"motion_joint_velocities_20frame_step2", 580, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 20, 2); }},
-              {"motion_anchor_orientation_20frame_step2", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 20, 2); }},
+              {"motion_anchor_orientation_20frame_step2", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 20, 2, 3); }},
               // Body diff observations (robot FK vs reference motion, 30 tracked + 3 extended = 33 bodies)
               {"diff_body_pos_b", 99, [this](std::vector<double>& buf, size_t offset) { return GatherDiffBodyPosB(buf, offset); }},
               {"diff_body_tannorm_pb", 198, [this](std::vector<double>& buf, size_t offset) { return GatherDiffBodyTannormPB(buf, offset); }}};
@@ -2921,6 +3081,17 @@ class G1Deploy {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
 
+      // Start GT odometry subscriber (FAST-LIO `/Odometry`-compatible).
+      // Used to anchor an "origin" frame at the robot's world pose at the
+      // moment the operator pressed T (play=true), so that diff_body_pos_b
+      // captures the real drift between robot and reference motion.
+      // Falls back to the legacy "ref-root as proxy" behavior if no message
+      // is ever received (e.g. running without a publisher).
+      odom_sub_ = std::make_unique<OdomSubscriber>("/Odometry", "g1_odom_subscriber");
+      if (!odom_sub_->start()) {
+        std::cout << "[G1Deploy] OdomSubscriber not started — origin-frame diff disabled." << std::endl;
+      }
+
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
@@ -2938,6 +3109,8 @@ class G1Deploy {
 
     ~G1Deploy()
     {
+      // Stop the odometry subscriber's spin thread before other teardown.
+      if (odom_sub_) odom_sub_->stop();
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
     }
 
@@ -4277,6 +4450,11 @@ class G1Deploy {
             // Update heading state (handles reinitialize_heading_ and frame-0 init)
             // Must run before any orientation observation functions
             UpdateHeadingState();
+
+            // Detect play=false→true transition and (re)capture the origin
+            // frame from GT odometry + motion frame-0 root pose. Subsequent
+            // diff observations use this origin frame.
+            MaybeCaptureOrigin();
 
             // Gather all observations using modular functions
             // This may update token_state_data_ with encoder output (if encoder is used)
